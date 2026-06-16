@@ -30,6 +30,8 @@
   .row label { width:90px; font-size:12px; color:var(--sub); }
   .row input[type=range] { flex:1; accent-color:var(--accent); }
   .row input.val { width:56px; text-align:right; font-size:12px; padding:4px 6px; border:1px solid #ccc; border-radius:6px; background:#fff; }
+  .lutbar { display:flex; align-items:center; gap:10px; margin:10px 0 4px; flex-wrap:wrap; }
+  #lutFile { display:none; }
   .tabs { display:flex; gap:6px; margin-bottom:12px; flex-wrap:wrap; }
   .tab { background:#222732; border:1px solid var(--line); padding:6px 12px; border-radius:20px; font-size:12px; cursor:pointer; }
   .tab.active { background:var(--accent); border-color:var(--accent); color:#fff; }
@@ -45,6 +47,12 @@
     <small>여러 톤을 한눈에 비교 · 마음에 들면 PNG 저장</small>
   </div>
   <input type="file" id="file" accept="image/*">
+
+  <div class="lutbar">
+    <button class="btn" id="lutBtn">＋ 프리 LUT(.cube) 불러오기</button>
+    <span id="lutInfo" class="sub"></span>
+  </div>
+  <input type="file" id="lutFile" accept=".cube,.CUBE" multiple>
 
   <div class="grid" id="grid"></div>
 
@@ -108,14 +116,86 @@ function load(file){
   img.src = URL.createObjectURL(file);
 }
 
+// ===== 외부 LUT(.cube) 불러오기 =====
+const loadedLuts = [];   // {name, size, data:Float32Array(size^3*3), dmin:[3], dmax:[3]}
+const lutBtn = document.getElementById('lutBtn');
+const lutFile = document.getElementById('lutFile');
+const lutInfo = document.getElementById('lutInfo');
+lutBtn.addEventListener('click', ()=> lutFile.click());
+lutFile.addEventListener('change', e=>{
+  const files=[...e.target.files]; if(!files.length) return;
+  let done=0;
+  files.forEach(f=>{
+    const rd=new FileReader();
+    rd.onload=()=>{
+      try{
+        const lut=parseCube(rd.result, f.name.replace(/\.cube$/i,''));
+        loadedLuts.push(lut);
+      }catch(err){ alert(`'${f.name}' 불러오기 실패: ${err.message}`); }
+      if(++done===files.length){ updateLutInfo(); if(baseImg) renderAll(); }
+    };
+    rd.readAsText(f);
+  });
+  lutFile.value='';
+});
+function updateLutInfo(){
+  lutInfo.textContent = loadedLuts.length
+    ? `불러온 LUT ${loadedLuts.length}개 — ${loadedLuts.map(l=>l.name).join(', ')}`
+    : '';
+}
+function parseCube(text, name){
+  const lines=text.split(/\r?\n/);
+  let size=0; const dmin=[0,0,0], dmax=[1,1,1]; const data=[];
+  for(let raw of lines){
+    const line=raw.trim();
+    if(!line || line[0]==='#') continue;
+    if(/^TITLE/i.test(line)) continue;
+    let m;
+    if(m=line.match(/^LUT_3D_SIZE\s+(\d+)/i)){ size=+m[1]; continue; }
+    if(/^LUT_1D_SIZE/i.test(line)) throw new Error('1D LUT은 미지원 (3D LUT만)');
+    if(m=line.match(/^DOMAIN_MIN\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)/i)){ dmin[0]=+m[1];dmin[1]=+m[2];dmin[2]=+m[3]; continue; }
+    if(m=line.match(/^DOMAIN_MAX\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)/i)){ dmax[0]=+m[1];dmax[1]=+m[2];dmax[2]=+m[3]; continue; }
+    const p=line.split(/\s+/).map(Number);
+    if(p.length>=3 && p.every(v=>!isNaN(v))){ data.push(p[0],p[1],p[2]); }
+  }
+  if(!size) throw new Error('LUT_3D_SIZE 없음 — 표준 .cube 파일 아님');
+  if(data.length !== size*size*size*3) throw new Error(`데이터 수 불일치 (${data.length/3}/${size*size*size})`);
+  return { name, size, data:Float32Array.from(data), dmin, dmax };
+}
+// 트라이리니어 보간으로 LUT 적용 (red가 가장 빠르게 변하는 표준 순서)
+function applyLut(ctx, w, h, lut){
+  const id=ctx.getImageData(0,0,w,h), d=id.data;
+  const N=lut.size, n=N-1, L=lut.data, dmin=lut.dmin, dmax=lut.dmax;
+  const idx=(r,g,b)=>((b*N+g)*N+r)*3;
+  for(let i=0;i<d.length;i+=4){
+    const rf=clampDom((d[i]/255-dmin[0])/(dmax[0]-dmin[0]))*n;
+    const gf=clampDom((d[i+1]/255-dmin[1])/(dmax[1]-dmin[1]))*n;
+    const bf=clampDom((d[i+2]/255-dmin[2])/(dmax[2]-dmin[2]))*n;
+    const r0=Math.floor(rf), g0=Math.floor(gf), b0=Math.floor(bf);
+    const r1=Math.min(r0+1,n), g1=Math.min(g0+1,n), b1=Math.min(b0+1,n);
+    const dr=rf-r0, dg=gf-g0, db=bf-b0;
+    let R=0,G=0,B=0;
+    for(let c=0;c<8;c++){
+      const xr=(c&1)?r1:r0, xg=(c&2)?g1:g0, xb=(c&4)?b1:b0;
+      const wgt=((c&1)?dr:1-dr)*((c&2)?dg:1-dg)*((c&4)?db:1-db);
+      const o=idx(xr,xg,xb);
+      R+=L[o]*wgt; G+=L[o+1]*wgt; B+=L[o+2]*wgt;
+    }
+    d[i]=clamp(R*255); d[i+1]=clamp(G*255); d[i+2]=clamp(B*255);
+  }
+  ctx.putImageData(id,0,0);
+}
+function clampDom(v){ return v<0?0:v>1?1:v; }
+
 function renderAll(){
   grid.innerHTML = '';
   // 원본
   grid.appendChild(makeCard('원본', '', null));
   order.forEach(k=> grid.appendChild(makeCard(PRESETS[k].name, PRESETS[k].tag, k)));
+  loadedLuts.forEach((lut,i)=> grid.appendChild(makeCard(lut.name, `프리 LUT · ${lut.size}³`, null, lut, i)));
 }
 
-function makeCard(title, tag, presetKey){
+function makeCard(title, tag, presetKey, lut, lutIdx){
   const card = document.createElement('div'); card.className='card';
   const head = document.createElement('div'); head.className='head';
   head.innerHTML = `<b>${title}</b><span>${tag}</span>`;
@@ -129,14 +209,20 @@ function makeCard(title, tag, presetKey){
   const ctx = cv.getContext('2d');
   ctx.drawImage(baseImg, 0,0, cv.width, cv.height);
   if(presetKey) applyTone(ctx, cv.width, cv.height, PRESETS[presetKey]);
+  else if(lut) applyLut(ctx, cv.width, cv.height, lut);
 
   const dl = document.createElement('button'); dl.className='btn'; dl.textContent='PNG 저장';
-  dl.onclick = ()=> { const a=document.createElement('a'); a.download=(presetKey||'original')+'.png'; a.href=cv.toDataURL('image/png'); a.click(); };
+  dl.onclick = ()=> { const a=document.createElement('a'); a.download=(presetKey||(lut?lut.name:'original'))+'.png'; a.href=cv.toDataURL('image/png'); a.click(); };
   foot.appendChild(dl);
   if(presetKey){
     const cube = document.createElement('button'); cube.className='btn'; cube.textContent='.cube 추출';
     cube.onclick = ()=> generateCube(PRESETS[presetKey], presetKey, 33);
     foot.appendChild(cube);
+  }
+  if(lut){
+    const rm = document.createElement('button'); rm.className='btn'; rm.textContent='✕ 제거';
+    rm.onclick = ()=> { loadedLuts.splice(lutIdx,1); updateLutInfo(); renderAll(); };
+    foot.appendChild(rm);
   }
   card.append(head, cv, foot);
   if(presetKey) card.dataset.preset = presetKey;
