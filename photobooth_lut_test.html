@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>포토부스 톤 필터 테스트</title>
+<style>
+  :root { --bg:#0f1115; --card:#1a1d24; --line:#2a2e38; --txt:#e8eaed; --sub:#9aa0aa; --accent:#529FD7; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { font-family:-apple-system,'Apple SD Gothic Neo','Pretendard',sans-serif; background:var(--bg); color:var(--txt); padding:16px; }
+  h1 { font-size:18px; margin-bottom:4px; }
+  .sub { color:var(--sub); font-size:13px; margin-bottom:16px; }
+  .drop { border:2px dashed var(--line); border-radius:14px; padding:28px 16px; text-align:center; cursor:pointer; transition:.15s; background:var(--card); }
+  .drop:hover, .drop.over { border-color:var(--accent); background:#1e222b; }
+  .drop small { color:var(--sub); display:block; margin-top:6px; font-size:12px; }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:14px; margin-top:18px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; overflow:hidden; }
+  .card .head { display:flex; justify-content:space-between; align-items:center; padding:10px 12px; }
+  .card .head b { font-size:14px; }
+  .card .head span { color:var(--sub); font-size:11px; }
+  .card canvas { width:100%; display:block; background:#000; }
+  .card .foot { padding:8px 12px; display:flex; gap:8px; }
+  .btn { flex:1; background:#222732; border:1px solid var(--line); color:var(--txt); padding:7px; border-radius:8px; font-size:12px; cursor:pointer; }
+  .btn:hover { border-color:var(--accent); }
+  .controls { margin-top:16px; background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; display:none; }
+  .controls.show { display:block; }
+  .controls h2 { font-size:13px; margin-bottom:10px; color:var(--sub); }
+  .row { display:flex; align-items:center; gap:10px; margin-bottom:8px; }
+  .row label { width:90px; font-size:12px; color:var(--sub); }
+  .row input[type=range] { flex:1; accent-color:var(--accent); }
+  .row input.val { width:56px; text-align:right; font-size:12px; padding:4px 6px; border:1px solid #ccc; border-radius:6px; background:#fff; }
+  .tabs { display:flex; gap:6px; margin-bottom:12px; flex-wrap:wrap; }
+  .tab { background:#222732; border:1px solid var(--line); padding:6px 12px; border-radius:20px; font-size:12px; cursor:pointer; }
+  .tab.active { background:var(--accent); border-color:var(--accent); color:#fff; }
+  input[type=file]{ display:none; }
+</style>
+</head>
+<body>
+  <h1>포토부스 톤 필터 테스트</h1>
+  <p class="sub">실제 포토부스 조명에서 찍은 인물 사진을 올려보세요. 블루-쿨 / 핑크-코랄 / 노멀 3톤이 실시간 적용됩니다.</p>
+
+  <div class="drop" id="drop">
+    📷 사진 클릭 또는 드래그해서 업로드
+    <small>여러 톤을 한눈에 비교 · 마음에 들면 PNG 저장</small>
+  </div>
+  <input type="file" id="file" accept="image/*">
+
+  <div class="grid" id="grid"></div>
+
+  <div class="controls" id="controls">
+    <h2>미세조정 (선택한 톤의 값을 바꿔 실시간 확인)</h2>
+    <div class="tabs" id="tabs"></div>
+    <div id="sliders"></div>
+  </div>
+
+<script>
+// ===== 톤 프리셋 (포토샵 분석값을 픽셀 파이프라인으로 변환) =====
+// blackLift: 그림자 들어올림 / bright: 밝기 / contrast: 대비(1=원본)
+// sat: 채도 / 색상밸런스는 shadow/mid/high 각 RGB 오프셋
+const PRESETS = {
+  blue: { name:'블루-쿨톤', tag:'청량·우유빛',
+    blackLift:12, bright:14, contrast:0.95, sat:0.93, lipSat:1.36,
+    sh:[ -3, 3, 12], mid:[ -3, 1, 7], hi:[ -5, 0, 9] },
+  pink: { name:'핑크-코랄톤', tag:'따뜻·로지',
+    blackLift:10, bright:12, contrast:0.95, sat:1.05, lipSat:1.08,
+    sh:[ 8, -1, -3], mid:[ 7, -2, -5], hi:[ 5, 0, -7] },
+  normal: { name:'노멀톤', tag:'클린·자연',
+    blackLift:6, bright:10, contrast:0.98, sat:1.02, lipSat:1.04,
+    sh:[ 2, 0, 0], mid:[ 3, 0, -2], hi:[ 2, 0, -3] },
+};
+
+let baseImg = null;
+const order = ['blue','pink','normal'];
+
+// 리셋용 초기값 + 톤별 되돌리기/앞으로가기 히스토리
+const clone = o => JSON.parse(JSON.stringify(o));
+const DEFAULTS = clone(PRESETS);
+const history = { blue:{stack:[], idx:-1}, pink:{stack:[], idx:-1}, normal:{stack:[], idx:-1} };
+function snapshot(key){
+  const h=history[key];
+  h.stack = h.stack.slice(0, h.idx+1);           // 분기 잘라내기
+  h.stack.push(clone(PRESETS[key]));
+  if(h.stack.length>50) h.stack.shift();          // 최대 50개
+  h.idx = h.stack.length-1;
+}
+function restoreFromHistory(key){
+  const snap = history[key].stack[history[key].idx];
+  PRESETS[key].blackLift=snap.blackLift; PRESETS[key].bright=snap.bright;
+  PRESETS[key].contrast=snap.contrast; PRESETS[key].sat=snap.sat; PRESETS[key].lipSat=snap.lipSat;
+  PRESETS[key].sh=snap.sh.slice(); PRESETS[key].mid=snap.mid.slice(); PRESETS[key].hi=snap.hi.slice();
+}
+order.forEach(k=>snapshot(k));   // 초기 상태 기록
+
+const drop = document.getElementById('drop');
+const fileInput = document.getElementById('file');
+const grid = document.getElementById('grid');
+
+drop.addEventListener('click', ()=> fileInput.click());
+fileInput.addEventListener('change', e=> { if(e.target.files[0]) load(e.target.files[0]); });
+['dragover','dragenter'].forEach(ev=> drop.addEventListener(ev, e=>{ e.preventDefault(); drop.classList.add('over'); }));
+['dragleave','drop'].forEach(ev=> drop.addEventListener(ev, e=>{ e.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', e=> { if(e.dataTransfer.files[0]) load(e.dataTransfer.files[0]); });
+
+function load(file){
+  const img = new Image();
+  img.onload = ()=> { baseImg = img; renderAll(); document.getElementById('controls').classList.add('show'); buildControls(); };
+  img.src = URL.createObjectURL(file);
+}
+
+function renderAll(){
+  grid.innerHTML = '';
+  // 원본
+  grid.appendChild(makeCard('원본', '', null));
+  order.forEach(k=> grid.appendChild(makeCard(PRESETS[k].name, PRESETS[k].tag, k)));
+}
+
+function makeCard(title, tag, presetKey){
+  const card = document.createElement('div'); card.className='card';
+  const head = document.createElement('div'); head.className='head';
+  head.innerHTML = `<b>${title}</b><span>${tag}</span>`;
+  const cv = document.createElement('canvas');
+  const foot = document.createElement('div'); foot.className='foot';
+
+  const maxW = 700;
+  const scale = Math.min(1, maxW/baseImg.width);
+  cv.width = Math.round(baseImg.width*scale);
+  cv.height = Math.round(baseImg.height*scale);
+  const ctx = cv.getContext('2d');
+  ctx.drawImage(baseImg, 0,0, cv.width, cv.height);
+  if(presetKey) applyTone(ctx, cv.width, cv.height, PRESETS[presetKey]);
+
+  const dl = document.createElement('button'); dl.className='btn'; dl.textContent='PNG 저장';
+  dl.onclick = ()=> { const a=document.createElement('a'); a.download=(presetKey||'original')+'.png'; a.href=cv.toDataURL('image/png'); a.click(); };
+  foot.appendChild(dl);
+  if(presetKey){
+    const cube = document.createElement('button'); cube.className='btn'; cube.textContent='.cube 추출';
+    cube.onclick = ()=> generateCube(PRESETS[presetKey], presetKey, 33);
+    foot.appendChild(cube);
+  }
+  card.append(head, cv, foot);
+  if(presetKey) card.dataset.preset = presetKey;
+  return card;
+}
+
+// ===== 톤 적용 엔진 =====
+// 0~255 입력 → 변환된 [r,g,b] 반환 (이미지 렌더 + .cube 생성 공용)
+function transformPixel(r, g, b, p){
+  // 1) 밝기 + 그림자 리프트(블랙포인트)
+  r = liftBright(r, p); g = liftBright(g, p); b = liftBright(b, p);
+  // 2) 대비 (mid 128 기준)
+  r = (r-128)*p.contrast+128; g=(g-128)*p.contrast+128; b=(b-128)*p.contrast+128;
+  // 3) 색상밸런스 (휘도 가중 shadow/mid/high)
+  const L = (0.299*r+0.587*g+0.114*b)/255;
+  const wsh = Math.max(0, 1-L*2);
+  const whi = Math.max(0, (L-0.5)*2);
+  const wmid = 1-Math.abs(L-0.5)*2;
+  r += p.sh[0]*wsh + p.mid[0]*wmid + p.hi[0]*whi;
+  g += p.sh[1]*wsh + p.mid[1]*wmid + p.hi[1]*whi;
+  b += p.sh[2]*wsh + p.mid[2]*wmid + p.hi[2]*whi;
+  // 4) 채도 — 입술(붉은 계열)은 부드러운 마스크로 점진 부스트, 나머지는 우유빛으로 살짝 빼기
+  const gray = 0.299*r+0.587*g+0.114*b;
+  const mx=Math.max(r,g,b), mn=Math.min(r,g,b);
+  const dmax=mx-mn;
+  const satPix=dmax/(mx+1e-6);
+  // 색조(0~360): 빨강=0
+  let hue=0;
+  if(dmax>1e-6){
+    if(mx===r) hue=((g-b)/dmax)%6;
+    else if(mx===g) hue=(b-r)/dmax+2;
+    else hue=(r-g)/dmax+4;
+    hue*=60; if(hue<0) hue+=360;
+  }
+  // 빨강(0/360) 중심으로 가까울수록 1, 주황(살색)으로 갈수록 0
+  const hueDist = Math.min(hue, 360-hue);
+  const hueW = smooth(1 - hueDist/40);           // 40도 밖이면 0
+  const satW = smooth((satPix-0.16)/0.30);       // 0.16~0.46 페더
+  const lipW = hueW*satW;                          // 0~1 부드러운 입술 가중치
+  const sf = p.sat + ((p.lipSat||p.sat)-p.sat)*lipW;
+  r = gray+(r-gray)*sf; g=gray+(g-gray)*sf; b=gray+(b-gray)*sf;
+  return [clamp(r), clamp(g), clamp(b)];
+}
+
+function applyTone(ctx, w, h, p){
+  const imgData = ctx.getImageData(0,0,w,h);
+  const d = imgData.data;
+  for(let i=0;i<d.length;i+=4){
+    const o = transformPixel(d[i], d[i+1], d[i+2], p);
+    d[i]=o[0]; d[i+1]=o[1]; d[i+2]=o[2];
+  }
+  ctx.putImageData(imgData,0,0);
+}
+
+// ===== .cube LUT 생성 (포토샵 색상 검색표 / 포토부스 공용) =====
+function generateCube(p, key, size){
+  size = size || 33;
+  let out = `# Generated by 포토부스 톤 필터 테스트\nTITLE "${key}"\nLUT_3D_SIZE ${size}\nDOMAIN_MIN 0.0 0.0 0.0\nDOMAIN_MAX 1.0 1.0 1.0\n`;
+  const n = size-1;
+  for(let bi=0; bi<size; bi++){
+    for(let gi=0; gi<size; gi++){
+      for(let ri=0; ri<size; ri++){
+        const o = transformPixel(ri/n*255, gi/n*255, bi/n*255, p);
+        out += `${(o[0]/255).toFixed(6)} ${(o[1]/255).toFixed(6)} ${(o[2]/255).toFixed(6)}\n`;
+      }
+    }
+  }
+  const blob = new Blob([out], {type:'text/plain'});
+  const a=document.createElement('a'); a.download=key+'.cube'; a.href=URL.createObjectURL(blob); a.click();
+}
+function liftBright(v, p){
+  // 블랙포인트 리프트: 0→blackLift, 255 유지 (선형 매핑) + 밝기
+  v = p.blackLift + v*(255-p.blackLift)/255;
+  return v + p.bright;
+}
+function clamp(v){ return v<0?0:v>255?255:v; }
+function smooth(t){ t=t<0?0:t>1?1:t; return t*t*(3-2*t); }   // smoothstep 페더링
+
+// ===== 미세조정 UI =====
+let activeKey = 'blue';
+// key: 프리셋 속성명, idx: 배열일 때 인덱스(sh/mid/hi)
+const PARAM_DEFS = [
+  {key:'bright',    label:'밝기',         min:-30, max:40,  step:1},
+  {key:'blackLift', label:'그림자 리프트', min:0,   max:50,  step:1},
+  {key:'contrast',  label:'대비',         min:0.6, max:1.3, step:0.01},
+  {key:'sat',       label:'채도(전체)',    min:0.5, max:1.5, step:0.01},
+  {key:'lipSat',    label:'입술 채도',     min:1.0, max:2.0, step:0.01},
+  {key:'sh', idx:0, label:'그림자 · R(빨강)',   min:-30, max:30, step:1},
+  {key:'sh', idx:1, label:'그림자 · G(초록)',   min:-30, max:30, step:1},
+  {key:'sh', idx:2, label:'그림자 · B(파랑)',   min:-30, max:30, step:1},
+  {key:'mid',idx:0, label:'중간톤 · R(빨강)',   min:-30, max:30, step:1},
+  {key:'mid',idx:1, label:'중간톤 · G(초록)',   min:-30, max:30, step:1},
+  {key:'mid',idx:2, label:'중간톤 · B(파랑)',   min:-30, max:30, step:1},
+  {key:'hi', idx:0, label:'밝은톤 · R(빨강)',   min:-30, max:30, step:1},
+  {key:'hi', idx:1, label:'밝은톤 · G(초록)',   min:-30, max:30, step:1},
+  {key:'hi', idx:2, label:'밝은톤 · B(파랑)',   min:-30, max:30, step:1},
+];
+function getParam(p, def){ return def.idx===undefined ? p[def.key] : p[def.key][def.idx]; }
+function setParam(p, def, v){ if(def.idx===undefined) p[def.key]=v; else p[def.key][def.idx]=v; }
+
+function updateHistButtons(){
+  const h=history[activeKey];
+  const u=document.getElementById('undoBtn'), r=document.getElementById('redoBtn');
+  if(u){ u.disabled = h.idx<=0; u.style.opacity = u.disabled?0.4:1; }
+  if(r){ r.disabled = h.idx>=h.stack.length-1; r.style.opacity = r.disabled?0.4:1; }
+}
+function buildControls(){
+  const tabs = document.getElementById('tabs'); tabs.innerHTML='';
+  order.forEach(k=>{
+    const t=document.createElement('div'); t.className='tab'+(k===activeKey?' active':''); t.textContent=PRESETS[k].name;
+    t.onclick=()=>{ activeKey=k; buildControls(); }; tabs.appendChild(t);
+  });
+  const box=document.getElementById('sliders'); box.innerHTML='';
+  PARAM_DEFS.forEach(def=>{
+    const row=document.createElement('div'); row.className='row';
+    const v = getParam(PRESETS[activeKey], def);
+    row.innerHTML=`<label>${def.label}</label><input type="range" min="${def.min}" max="${def.max}" step="${def.step}" value="${v}"><input type="number" class="val" min="${def.min}" max="${def.max}" step="${def.step}" value="${v}">`;
+    const range=row.querySelector('input[type=range]'); const val=row.querySelector('input[type=number]');
+    const apply=(raw)=>{ let n=parseFloat(raw); if(isNaN(n)) return; n=Math.min(def.max,Math.max(def.min,n)); setParam(PRESETS[activeKey], def, n); refreshCard(activeKey); return n; };
+    range.oninput=()=>{ val.value=range.value; apply(range.value); };
+    range.onchange=()=>{ snapshot(activeKey); updateHistButtons(); };
+    val.onchange=()=>{ const n=apply(val.value); if(n!==undefined){ val.value=n; range.value=n; snapshot(activeKey); updateHistButtons(); } };
+    box.appendChild(row);
+  });
+  // 되돌리기 / 앞으로 / 리셋
+  const histBar=document.createElement('div'); histBar.style.cssText='display:flex; gap:6px; margin-top:12px;';
+  const undoBtn=document.createElement('button'); undoBtn.className='btn'; undoBtn.id='undoBtn'; undoBtn.textContent='↶ 되돌리기';
+  const redoBtn=document.createElement('button'); redoBtn.className='btn'; redoBtn.id='redoBtn'; redoBtn.textContent='↷ 앞으로';
+  const resetBtn=document.createElement('button'); resetBtn.className='btn'; resetBtn.textContent='⟲ 이 톤 초기화';
+  undoBtn.onclick=()=>{ const h=history[activeKey]; if(h.idx>0){ h.idx--; restoreFromHistory(activeKey); buildControls(); refreshCard(activeKey); } };
+  redoBtn.onclick=()=>{ const h=history[activeKey]; if(h.idx<h.stack.length-1){ h.idx++; restoreFromHistory(activeKey); buildControls(); refreshCard(activeKey); } };
+  resetBtn.onclick=()=>{ const d=DEFAULTS[activeKey]; const p=PRESETS[activeKey];
+    p.blackLift=d.blackLift; p.bright=d.bright; p.contrast=d.contrast; p.sat=d.sat; p.lipSat=d.lipSat;
+    p.sh=d.sh.slice(); p.mid=d.mid.slice(); p.hi=d.hi.slice();
+    snapshot(activeKey); buildControls(); refreshCard(activeKey); };
+  histBar.appendChild(undoBtn); histBar.appendChild(redoBtn); histBar.appendChild(resetBtn);
+  box.appendChild(histBar);
+  updateHistButtons();
+  // 현재값 복사 버튼
+  const copy=document.createElement('button'); copy.className='btn'; copy.style.marginTop='10px'; copy.textContent='현재값 복사 (나한테 붙여넣기용)';
+  copy.onclick=()=>{
+    const p=PRESETS[activeKey];
+    const txt=`${activeKey}: blackLift:${p.blackLift}, bright:${p.bright}, contrast:${p.contrast}, sat:${p.sat}, lipSat:${p.lipSat}, sh:[${p.sh}], mid:[${p.mid}], hi:[${p.hi}]`;
+    navigator.clipboard.writeText(txt).then(()=>{ copy.textContent='복사됨!'; setTimeout(()=>copy.textContent='현재값 복사 (나한테 붙여넣기용)',1200); });
+  };
+  box.appendChild(copy);
+}
+function refreshCard(key){
+  const card=[...grid.children].find(c=>c.dataset.preset===key);
+  if(!card) return;
+  const cv=card.querySelector('canvas'); const ctx=cv.getContext('2d');
+  ctx.drawImage(baseImg,0,0,cv.width,cv.height);
+  applyTone(ctx,cv.width,cv.height,PRESETS[key]);
+}
+</script>
+</body>
+</html>
